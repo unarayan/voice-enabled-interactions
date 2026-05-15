@@ -12,7 +12,7 @@ models:
   llm:
     hf_id: "Qwen/Qwen2.5-7B-Instruct"
     device: "GPU"
-    weight_format: "int4"
+    weight_format: "int8"
     models_base_path: "./models/llm"
     temperature: 0.0
     # Persist compiled GPU kernels here so the periodic LLMPipeline recycle

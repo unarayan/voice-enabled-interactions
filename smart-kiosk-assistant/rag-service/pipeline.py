@@ -40,6 +40,7 @@ class YieldingTextStreamer(ov_genai.StreamerBase):
         self._token_cache: list[int] = []
         self._print_len = 0
         self._exc: Exception | None = None
+        self._ended = False  # FIX: guard against double end()
 
     def put(self, token_id: int) -> bool:
         self._token_cache.append(token_id)
@@ -60,6 +61,11 @@ class YieldingTextStreamer(ov_genai.StreamerBase):
         return False
 
     def end(self) -> None:
+        # FIX: ov_genai may call end() internally; guard against double-call
+        # to avoid pushing two None sentinels which corrupts the iterator.
+        if self._ended:
+            return
+        self._ended = True
         if self._token_cache:
             text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
             remaining = text[self._print_len:]
@@ -134,14 +140,27 @@ class RagPipeline:
         self._device = str(getattr(llm_cfg, "device", "CPU")).upper()
         self._temperature = float(getattr(llm_cfg, "temperature", 0.0))
         self._default_max_new_tokens = int(getattr(config.answering, "max_tokens", 192))
+        self._chunker_max_new_tokens = int(getattr(config.answering, "chunker_max_tokens", 128))
         self._max_generations_before_reload = int(
             getattr(config.answering, "max_generations_before_reload", 25)
         )
         self._generations_since_reload = 0
 
-        # Plugin properties — primarily CACHE_DIR so periodic reloads skip
-        # kernel compilation on the GPU and complete in seconds.
+        # Plugin properties — tuned for iGPU to reduce memory pressure.
+        # FIX: f16 inference + f16 KV cache halves GPU memory vs f32 defaults.
+        # FIX: NUM_STREAMS=1 prevents iGPU from allocating parallel execution
+        #      buffers which multiply peak VRAM usage.
         self._plugin_config: dict[str, str] = {}
+
+        if self._device == "GPU":
+            self._plugin_config["INFERENCE_PRECISION_HINT"] = "f16"
+            self._plugin_config["KV_CACHE_PRECISION"] = "f16"
+            self._plugin_config["NUM_STREAMS"] = "1"
+            logger.info(
+                "[LLM] iGPU detected — applied memory-saving plugin config: %s",
+                self._plugin_config,
+            )
+
         cache_dir = getattr(llm_cfg, "cache_dir", None)
         if cache_dir:
             cache_path = pathlib.Path(cache_dir).expanduser().resolve()
@@ -161,10 +180,32 @@ class RagPipeline:
         self._llm_lock = threading.RLock()
         self._llm = self._load_llm()
 
+        # FIX: Use a dedicated wrapper with capped max_new_tokens for chunking.
+        # The chunker only needs short completions (section titles, boundaries),
+        # so passing max_tokens=None → _default_max_new_tokens was wasteful and
+        # caused the LLMPipeline to pre-allocate large KV cache on first call,
+        # triggering CL_OUT_OF_RESOURCES on iGPU before any real work happened.
         self.chunker = SemanticChunker(
             self.embedding_component,
-            self._generate_text,
+            self._chunker_generate,
             llm_tokenizer=self._tokenizer,
+        )
+
+    def _chunker_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
+        """Thin wrapper used exclusively by SemanticChunker.
+
+        Caps max_new_tokens to _chunker_max_new_tokens so the iGPU KV cache
+        allocation stays well within available memory. The caller-supplied
+        max_tokens is respected only if it is smaller than the cap.
+        Temperature defaults to 0 for deterministic chunking decisions.
+        """
+        capped = self._chunker_max_new_tokens
+        if max_tokens is not None:
+            capped = min(max_tokens, capped)
+        return self._generate_text(
+            prompt,
+            max_tokens=capped,
+            temperature=temperature if temperature is not None else 0.0,
         )
 
     def _load_llm(self) -> ov_genai.LLMPipeline:
@@ -446,22 +487,39 @@ class RagPipeline:
         streamer = YieldingTextStreamer(self._tokenizer)
 
         def _run_generation() -> None:
+            # FIX: Do NOT call streamer.end() in finally — ov_genai calls it
+            # internally when generation completes normally. Calling it again
+            # pushed a second None sentinel into the queue, which either caused
+            # the iterator to stop one token early or (in some OV builds) triggered
+            # a second forward pass leading to a spurious OOM on the GPU.
+            # We only manually signal end() in the error path where ov_genai
+            # may not have had a chance to call it itself.
             try:
                 with self._llm_lock:
                     try:
                         self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
                     except Exception as exc:  # noqa: BLE001
                         if not self._is_resource_exhaustion(exc):
-                            raise
-                        logger.warning("[LLM] Stream generation hit resource exhaustion; recycling pipeline and retrying once: %s", exc)
+                            logger.error("[LLM] Stream generation failed: %s", exc)
+                            streamer._exc = exc
+                            streamer.end()  # ensure iterator unblocks on error
+                            return
+                        logger.warning(
+                            "[LLM] Stream generation hit resource exhaustion; recycling pipeline and retrying once: %s", exc
+                        )
                         self._reload_llm_locked()
-                        self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+                        try:
+                            self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+                        except Exception as retry_exc:  # noqa: BLE001
+                            logger.error("[LLM] Stream generation failed after retry: %s", retry_exc)
+                            streamer._exc = retry_exc
+                            streamer.end()  # ensure iterator unblocks on error
+                            return
                     self._post_generation_locked()
             except Exception as exc:  # noqa: BLE001
-                logger.error("[LLM] Stream generation failed: %s", exc)
+                logger.error("[LLM] Unexpected stream generation error: %s", exc)
                 streamer._exc = exc
-            finally:
-                streamer.end()
+                streamer.end()  # ensure iterator unblocks on error
 
         thread = threading.Thread(target=_run_generation, daemon=True)
         thread.start()
@@ -483,6 +541,8 @@ class RagPipeline:
 
     def source_payloads(self, records: list[RetrievalRecord]) -> list[dict]:
         return [self.source_payload(record) for record in records]
+
+
 def close_shared_pipeline() -> None:
     global _SHARED_PIPELINE
     with _SHARED_PIPELINE_LOCK:

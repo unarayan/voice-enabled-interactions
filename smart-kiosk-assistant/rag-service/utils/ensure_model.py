@@ -120,7 +120,6 @@ def _export_openvino_model(
     main_export(
         model_name_or_path=model_name,
         output=output_dir,
-        task=task or "text-generation-with-past",
         trust_remote_code=True,
         weight_format=weight_format,
     )

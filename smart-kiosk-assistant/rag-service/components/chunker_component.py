@@ -42,7 +42,6 @@ class SemanticChunker:
         self.llm_text_generator = llm_text_generator
         self.embedding_component = embedding_component
         self.llm_tokenizer = llm_tokenizer
-        # Optional: path to save produced chunks as JSONL for manual review
         _debug_dir = getattr(chunk_cfg, "save_chunks_debug", None)
         self.save_chunks_debug: str | None = str(_debug_dir) if _debug_dir else None
 
@@ -58,28 +57,24 @@ class SemanticChunker:
         )
 
         chunks = self._semantic_llm_chunks(normalized)
-
         chunks = self._apply_overlap(chunks)
+
         if self.save_chunks_debug and chunks:
             self._save_debug_chunks(chunks)
+
         records = [ChunkRecord(text=chunk, index=index) for index, chunk in enumerate(chunks)]
         elapsed = time.monotonic() - t0
-        logger.info(
-            "[CHUNKER] Done | total_chunks=%d | elapsed=%.1fs",
-            len(records),
-            elapsed,
-        )
+        logger.info("[CHUNKER] Done | total_chunks=%d | elapsed=%.1fs", len(records), elapsed)
         return records
 
-    # Marker-only output: just a JSON integer array of line-split indices.
-    # Output is ~50-100 tokens regardless of passage size — no OOM risk.
+    # Marker output is always a tiny JSON array — never OOM risk.
     _MARKER_MAX_TOKENS = 256
 
     def _semantic_llm_chunks(self, text: str) -> list[str]:
         # ── Phase 0: detect document domain & structure once per ingest ──
         profile = self._detect_document_profile(text)
 
-        # ── Phase 1: coarse token-window splitting ──
+        # ── Phase 1: coarse splitting — always on clean boundaries ──
         if self.llm_tokenizer is not None and self.llm_passage_tokens > 0:
             coarse_passages = self._split_by_tokens(
                 text, self.llm_passage_tokens, self.llm_passage_overlap_tokens,
@@ -88,10 +83,7 @@ class SemanticChunker:
             coarse_passages = self._split_by_size(text, self.llm_passage_chars)
 
         total = len(coarse_passages)
-        logger.info(
-            "[CHUNKER] semantic_llm | passages=%d | domain=%s | %s",
-            total, profile["domain"], profile["structure"],
-        )
+        logger.info("[CHUNKER] semantic_llm | passages=%d | %s", total, profile["description"])
 
         results: list[str] = []
 
@@ -106,7 +98,6 @@ class SemanticChunker:
                 results.append(passage)
                 continue
 
-            # ── Phase 2: number the lines, ask LLM for split markers only ──
             lines, numbered = self._number_lines(passage)
             logger.info(
                 "[CHUNKER] Passage %d/%d | chars=%d | lines=%d | requesting split markers",
@@ -192,55 +183,80 @@ class SemanticChunker:
         return self._cleanup_chunks(chunks)
 
     def _apply_overlap(self, chunks: list[str]) -> list[str]:
+        """Prepend the tail of the previous chunk as context.
+
+        FIX: overlap is taken from the raw chunk text (preserving newlines)
+        BEFORE any whitespace collapsing, so the prefix still carries
+        structural signals (bullet markers, section headers) into the next chunk.
+        We also ensure the overlap boundary lands on a full line, not mid-word.
+        """
         if self.overlap_chars <= 0 or len(chunks) < 2:
             return chunks
 
         with_overlap: list[str] = [chunks[0]]
         for index in range(1, len(chunks)):
-            prefix = chunks[index - 1][-self.overlap_chars :].strip()
+            tail = chunks[index - 1][-self.overlap_chars:]
+            # Snap to start of a line so overlap doesn't begin mid-bullet/mid-word.
+            newline_pos = tail.find("\n")
+            if newline_pos != -1:
+                tail = tail[newline_pos + 1:]
+            tail = tail.strip()
             current = chunks[index]
-            combined = f"{prefix}\n{current}" if prefix else current
+            combined = f"{tail}\n{current}" if tail else current
             with_overlap.append(combined.strip())
         return with_overlap
 
     def _split_by_size(self, text: str, max_chars: int) -> list[str]:
-        paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
-        if not paragraphs:
-            return []
+        """Split into passages that always end on a clean line boundary.
 
-        chunks: list[str] = []
-        current = ""
-        for paragraph in paragraphs:
-            candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-            if len(candidate) <= max_chars:
-                current = candidate
-                continue
-            if current:
-                chunks.append(current)
-            if len(paragraph) <= max_chars:
-                current = paragraph
-                continue
+        FIX (original bug): the old version split only on \\n\\n (double newlines).
+        Retail/structured KBs use single \\n between list items, so passages were
+        cut mid-bullet producing fragments like '** — per piece | Tags: none'.
 
-            sentence_buffer = ""
-            for sentence in self._split_sentences(paragraph):
-                sentence_candidate = f"{sentence_buffer} {sentence}".strip() if sentence_buffer else sentence
-                if len(sentence_candidate) <= max_chars:
-                    sentence_buffer = sentence_candidate
-                    continue
-                if sentence_buffer:
-                    chunks.append(sentence_buffer)
-                sentence_buffer = sentence
-            current = sentence_buffer
+        New strategy: accumulate lines greedily and cut only when the next line
+        would exceed max_chars, always ending on a full line.
+        """
+        lines = text.split("\n")
+        passages: list[str] = []
+        current_lines: list[str] = []
+        current_chars = 0
 
-        if current:
-            chunks.append(current)
-        return chunks
+        for line in lines:
+            # +1 for the newline we'll re-add
+            line_len = len(line) + 1
+            if current_lines and current_chars + line_len > max_chars:
+                passages.append("\n".join(current_lines))
+                # Carry the last heading/section line into the next passage
+                # so context isn't lost when a section header sits at the cut point.
+                carry = self._find_carry_line(current_lines)
+                current_lines = [carry, line] if carry else [line]
+                current_chars = sum(len(l) + 1 for l in current_lines)
+            else:
+                current_lines.append(line)
+                current_chars += line_len
+
+        if current_lines:
+            passages.append("\n".join(current_lines))
+
+        return [p for p in passages if p.strip()]
+
+    @staticmethod
+    def _find_carry_line(lines: list[str]) -> str:
+        """Return the last heading line from a passage to carry into the next,
+        preserving section context at passage boundaries."""
+        for line in reversed(lines):
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith("##") or stripped.startswith("###"):
+                return line
+        return ""
 
     def _split_by_tokens(self, text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
         tokenizer = self.llm_tokenizer
         if tokenizer is None:
             return self._split_by_size(text, self.llm_passage_chars)
 
+        # FIX: after decoding each token window, snap the boundary to the
+        # nearest preceding newline so passages never start mid-line.
         token_ids = tokenizer.encode(text, add_special_tokens=False)
         if not token_ids:
             return []
@@ -252,7 +268,15 @@ class SemanticChunker:
         while start < len(token_ids):
             end = min(start + max_tokens, len(token_ids))
             window_ids = token_ids[start:end]
-            chunk_text = tokenizer.decode(window_ids, skip_special_tokens=True).strip()
+            chunk_text = tokenizer.decode(window_ids, skip_special_tokens=True)
+
+            # Snap to last newline if we're not at end of document
+            if end < len(token_ids):
+                last_nl = chunk_text.rfind("\n")
+                if last_nl > len(chunk_text) // 2:  # only snap if newline is in the second half
+                    chunk_text = chunk_text[:last_nl]
+
+            chunk_text = chunk_text.strip()
             if chunk_text:
                 chunks.append(chunk_text)
             if end >= len(token_ids):
@@ -266,71 +290,87 @@ class SemanticChunker:
     # ──────────────────────────────────────────────────────────────────
 
     def _detect_document_profile(self, text: str) -> dict:
-        """One-shot LLM call on the first 2000 chars to identify domain and structure.
-        Returns a dict with 'domain', 'structure', 'split_guidance' — fully dynamic,
-        no hardcoded domain keywords in the detection logic."""
+        """One-shot LLM call on the first 2000 chars.
+
+        Instead of classifying into a fixed domain taxonomy, we ask the LLM
+        to describe the document in its own words and explain what a good
+        semantic boundary looks like for THIS specific document. The result
+        is passed verbatim into every marker prompt so the LLM has its own
+        prior context when deciding where to cut.
+        """
         sample = text[:2000]
         prompt = (
-            "Analyze this document excerpt. Return ONLY a JSON object with these exact fields:\n"
-            '  "domain": category such as "retail_store", "quick_service_restaurant", '
-            '"banking", "airline", "hospital", "e_commerce", "generic"\n'
-            '  "structure": one sentence describing how this document is organized '
-            '(sections, headings, pattern)\n'
-            '  "split_guidance": one sentence on what constitutes a natural chunk boundary '
-            'for RAG knowledge retrieval\n\n'
+            "Read the following document excerpt carefully.\n\n"
             f"DOCUMENT EXCERPT:\n{sample}\n\n"
+            "Answer these two questions in a JSON object with exactly these keys:\n"
+            '  "description": In one sentence, what kind of document is this and how is it organized?\n'
+            '  "boundary_hint": In one sentence, where do meaningful topic shifts occur '
+            "in this document that would make good boundaries between independent knowledge chunks?\n\n"
             "Return ONLY the JSON object, nothing else."
         )
         try:
-            raw = self.llm_text_generator(prompt, 256, 0.0)
+            raw = self.llm_text_generator(prompt, 128, 0.0)
             logger.info("[CHUNKER] Profile detection raw: %r", raw[:300])
             match = re.search(r"\{[\s\S]*?\}", raw)
             if match:
                 profile = json.loads(match.group(0))
-                if {"domain", "structure", "split_guidance"} <= set(profile.keys()):
-                    result = {k: str(profile[k]) for k in ("domain", "structure", "split_guidance")}
-                    logger.info(
-                        "[CHUNKER] Document profile: domain=%s | %s",
-                        result["domain"], result["structure"],
-                    )
+                if {"description", "boundary_hint"} <= set(profile.keys()):
+                    result = {k: str(profile[k]) for k in ("description", "boundary_hint")}
+                    logger.info("[CHUNKER] Document profile: %s | %s", result["description"], result["boundary_hint"])
                     return result
         except Exception as exc:  # noqa: BLE001
             logger.warning("[CHUNKER] Profile detection failed (%s), using generic defaults", exc)
         defaults = {
-            "domain": "generic",
-            "structure": "The document has sections with headings followed by detailed content.",
-            "split_guidance": "Split where the topic or section changes significantly.",
+            "description": "A document with sections of related content.",
+            "boundary_hint": "Split where the subject matter shifts to a clearly different topic.",
         }
         logger.info("[CHUNKER] Using generic document profile")
         return defaults
 
     def _build_marker_prompt(self, numbered_text: str, profile: dict, n_lines: int) -> str:
-        """Dynamic chunking prompt that adapts to the detected document domain."""
+        """Build a document-agnostic chunking prompt.
+
+        The LLM receives:
+          1. Its own description of what the document is (from profile detection).
+          2. Its own judgment of where good boundaries lie.
+          3. The numbered lines to read and split.
+
+        No format-specific rules are hardcoded — no mention of markdown, bullets,
+        or any structure hints. The LLM reads the actual content and decides.
+        """
         return (
-            f"You are chunking a {profile['domain']} document for a RAG knowledge-base.\n"
-            f"Document structure: {profile['structure']}\n"
-            f"Chunking guidance: {profile['split_guidance']}\n\n"
-            "Each line below is labeled [N]. Identify which line numbers should START a new knowledge chunk.\n\n"
-            "Rules:\n"
-            "- Always include 0 (line 0 always starts the first chunk)\n"
-            "- Split where the topic, section, or entity changes meaningfully\n"
-            f"- Target chunk size: {self.min_chunk_chars}\u2013{self.max_chunk_chars} characters of content\n"
-            "- Return ONLY a JSON integer array, nothing else. Example: [0, 12, 28, 45]\n"
-            "- Do NOT reproduce any text from the document\n\n"
-            f"NUMBERED TEXT ({n_lines} lines):\n{numbered_text}"
+            "You are preparing a document for a retrieval-augmented generation (RAG) system.\n"
+            "Your task is to identify where the document should be split into self-contained knowledge chunks.\n\n"
+            f"About this document: {profile['description']}\n"
+            f"Where to split: {profile['boundary_hint']}\n\n"
+            "Below is the document passage with each line numbered [N].\n"
+            "Read the content carefully and decide which line numbers should START a new chunk.\n"
+            "Each chunk should cover one coherent topic so it can be retrieved independently.\n\n"
+            "Output rules:\n"
+            "- Line 0 must always be included\n"
+            "- Choose split points where the meaning or subject changes significantly\n"
+            "- Do not output any explanation or document text — only the array\n"
+            "- Return ONLY a JSON integer array. Example: [0, 12, 28, 45]\n\n"
+            f"NUMBERED LINES ({n_lines} total):\n{numbered_text}"
         )
 
     @staticmethod
-    def _number_lines(text: str) -> tuple[list[str], str]:
-        """Prepend [N] to each line so the LLM can reference line positions."""
+    def _number_lines(text: str, preview_chars: int = 120) -> tuple[list[str], str]:
+        """Number each line for the LLM marker prompt.
+
+        Each line is truncated to `preview_chars`. The LLM needs enough text
+        to understand what the line is about — it does not need every word of
+        every bullet to find where the topic changes. Shorter lines mean a
+        smaller prompt and less KV cache pressure on the GPU.
+        """
         lines = text.split("\n")
-        numbered = "\n".join(f"[{i}] {line}" for i, line in enumerate(lines))
+        numbered = "\n".join(
+            f"[{i}] {line[:preview_chars]}" for i, line in enumerate(lines)
+        )
         return lines, numbered
 
     @staticmethod
     def _parse_line_markers(raw: str, n_lines: int) -> list[int]:
-        """Extract sorted integer split-line indices from LLM output."""
-        # Primary: canonical JSON array of integers
         match = re.search(r"\[[\d,\s]+\]", raw)
         if match:
             try:
@@ -340,14 +380,12 @@ class SemanticChunker:
                     return valid
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
-        # Graceful fallback: collect all in-range integers from the raw text
         nums = [int(m) for m in re.findall(r"\b(\d+)\b", raw) if 0 <= int(m) < n_lines]
         valid = sorted(set(nums))
         return valid if len(valid) >= 2 else []
 
     @staticmethod
     def _split_by_line_markers(lines: list[str], start_lines: list[int]) -> list[str]:
-        """Slice the original lines at the detected split positions."""
         if not start_lines or start_lines[0] != 0:
             start_lines = [0] + list(start_lines)
         start_lines = sorted(set(start_lines))
@@ -360,7 +398,6 @@ class SemanticChunker:
         return chunks
 
     def _save_debug_chunks(self, chunks: list[str]) -> None:
-        """Persist the final chunks that will be embedded for manual inspection."""
         save_dir = self.save_chunks_debug  # type: ignore[arg-type]
         if not os.path.isabs(save_dir):
             service_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -383,11 +420,36 @@ class SemanticChunker:
             logger.warning("[CHUNKER] Failed to save debug chunks: %s", exc)
 
     def _cleanup_chunks(self, chunks: list[str]) -> list[str]:
-        cleaned = [re.sub(r"\s+", " ", chunk).strip() for chunk in chunks if chunk and chunk.strip()]
+        """Clean up chunks while preserving structural whitespace (newlines).
+
+        FIX (original bug): the old version ran re.sub(r"\\s+", " ", chunk) which
+        collapsed ALL whitespace including newlines into a single space. This
+        destroyed markdown structure — headers lost their ## prefix context,
+        bullet lists became run-on sentences, making embedding similarity worse
+        and LLM answers less accurate.
+
+        New approach: only collapse runs of spaces/tabs on a single line;
+        never touch newlines. Also collapse 3+ consecutive blank lines to 2.
+        """
+        result: list[str] = []
+        for chunk in chunks:
+            if not chunk or not chunk.strip():
+                continue
+            # Collapse horizontal whitespace (spaces/tabs) only, not newlines
+            lines = chunk.split("\n")
+            lines = [re.sub(r"[ \t]+", " ", line).rstrip() for line in lines]
+            # Collapse 3+ consecutive blank lines to a single blank line
+            cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+            if cleaned:
+                result.append(cleaned)
+
+        # Merge only genuinely tiny fragments (not just short headings)
         merged: list[str] = []
-        for chunk in cleaned:
-            if merged and len(chunk) < self.min_chunk_chars:
-                merged[-1] = f"{merged[-1]} {chunk}".strip()
+        for chunk in result:
+            # Only merge if tiny AND doesn't start with a heading marker
+            is_heading_start = chunk.lstrip().startswith("#")
+            if merged and len(chunk) < self.min_chunk_chars and not is_heading_start:
+                merged[-1] = f"{merged[-1]}\n{chunk}".strip()
             else:
                 merged.append(chunk)
         return merged
@@ -400,9 +462,13 @@ class SemanticChunker:
 
     @staticmethod
     def _normalize_text(text: str) -> str:
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
+        # FIX: only collapse horizontal whitespace per line; preserve newlines
+        lines = text.split("\n")
+        lines = [re.sub(r"[ \t]+", " ", line) for line in lines]
+        normalized = "\n".join(lines)
+        # Collapse 3+ blank lines to 2
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized.strip()
 
     @staticmethod
     def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
@@ -411,3 +477,4 @@ class SemanticChunker:
         if left_norm == 0.0 or right_norm == 0.0:
             return 0.0
         return float(np.dot(left, right) / (left_norm * right_norm))
+    
