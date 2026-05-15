@@ -5,15 +5,13 @@ USER root
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/app/rag-service/.cache/huggingface
+    HF_HOME=/root/.cache/huggingface
 
 WORKDIR /app/rag-service
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-pip \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r ragservice \
-    && useradd -r -g ragservice -d /app/rag-service ragservice
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./requirements.txt
 
@@ -21,10 +19,6 @@ RUN python3 -m pip install --upgrade pip \
     && python3 -m pip install -r requirements.txt
 
 COPY . .
-
-RUN chown -R ragservice:ragservice /app/rag-service
-
-USER ragservice
 
 EXPOSE 8020
 

@@ -16,5 +16,5 @@ services:
       - ./config.container.yaml:/app/rag-service/config.container.yaml:ro
       - ./models:/app/rag-service/models
       - ./storage:/app/rag-service/storage
-      - ./.cache/huggingface:/app/rag-service/.cache/huggingface
+      - ./.cache/huggingface:/root/.cache/huggingface
     restart: unless-stopped

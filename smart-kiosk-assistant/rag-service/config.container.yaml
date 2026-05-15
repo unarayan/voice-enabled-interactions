@@ -2,8 +2,58 @@ server:
   host: "0.0.0.0"
   port: 8020
 
+api:
+  cors_allow_origins:
+    - "http://127.0.0.1"
+    - "http://localhost"
+  openai_model_name: "smart-kiosk-rag"
+
 models:
   llm:
+    hf_id: "Qwen/Qwen2.5-7B-Instruct"
     device: "GPU"
+    weight_format: "int4"
+    models_base_path: "./models/llm"
+    temperature: 0.0
+    # Persist compiled GPU kernels here so the periodic LLMPipeline recycle
+    # skips kernel compilation (first load is normal, subsequent reloads are
+    # ~few seconds instead of ~minute). Set to null/empty to disable.
+    cache_dir: "./storage/ov_cache"
   embedding:
+    hf_id: "BAAI/bge-large-en-v1.5"
     device: "CPU"
+    models_base_path: "./models/embeddings"
+    normalize_embeddings: true
+
+storage:
+  persist_directory: "./storage/vector_db"
+  collection_name: "smart-kiosk-assistant-bge-large"
+
+retrieval:
+  top_k: 3
+  fetch_k: 6
+  max_context_chars: 8000
+  score_threshold: null
+
+chunking:
+  max_chunk_chars: 1500
+  min_chunk_chars: 200
+  overlap_chars: 200
+  semantic_similarity_threshold: 0.72
+  llm_passage_chars: 10000
+  llm_passage_tokens: 3000      # wide enough to keep a full semantic intact before LLM splits it
+  llm_passage_overlap_tokens: 300
+  save_chunks_debug: "./storage/chunks_debug"  # set to null to disable
+
+answering:
+  system_prompt: |
+    You are Smart Kiosk Assistant for a retail store.
+    Use the retrieved context first. Answer clearly, directly, and in a way that can be spoken aloud.
+    If the context is insufficient, say what you do know and avoid inventing store-specific facts.
+  fallback_to_general_knowledge: true
+  include_source_markers: false
+  max_tokens: 192
+  # Proactively recycle the OpenVINO LLMPipeline after this many generate()
+  # calls to release iGPU KV/working memory and avoid CL_OUT_OF_RESOURCES.
+  # Set to 0 to disable proactive recycling (only on-error recycling will run).
+  max_generations_before_reload: 15
