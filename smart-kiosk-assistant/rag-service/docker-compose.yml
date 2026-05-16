@@ -10,6 +10,7 @@ services:
       - /dev/dri:/dev/dri
     group_add:
       - video
+      - render
     environment:
       SMART_KIOSK_RAG_CONFIG_OVERRIDE_PATHS: /app/rag-service/config.container.yaml
     volumes:

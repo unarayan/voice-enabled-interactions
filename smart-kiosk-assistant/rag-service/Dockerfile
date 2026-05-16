@@ -1,4 +1,4 @@
-FROM openvino/ubuntu24_runtime:2025.4.0
+FROM openvino/ubuntu24_runtime:2026.1.0
 
 USER root
 
@@ -12,6 +12,11 @@ WORKDIR /app/rag-service
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Intel GPU compute-runtime is NOT installed inside the image. The container
+# uses the host's /dev/dri device, so the relevant driver stack is whatever
+# is installed on the host. See README "Intel GPU driver setup" for the
+# one-time host install (driver 26.18+ is required for prompts > ~3k tokens).
 
 COPY requirements.txt ./requirements.txt
 
