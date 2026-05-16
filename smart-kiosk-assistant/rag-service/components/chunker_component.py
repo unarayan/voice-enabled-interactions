@@ -1,21 +1,26 @@
 """Document chunking strategies for the RAG service.
 
-Two strategies are supported, configurable via ``chunking.strategy``:
+Three strategies are supported, configurable via ``chunking.strategy``:
 
 * ``semantic`` (default) — embedding-based. Splits text into sentences,
   embeds each one with the configured embedding model, and starts a new
   chunk whenever consecutive sentences fall below a similarity threshold
   or the running chunk hits ``max_chunk_chars``. Markdown headers are
-  honored as hard boundaries when present, so structured documents stay
-  organized without any markdown-specific tuning.
+  honored as hard boundaries when present.
 
 * ``fixed`` — character-based recursive split. Splits on paragraph,
   then line, then sentence, then word boundaries until each piece fits
   inside ``max_chunk_chars``. Deterministic, fast, and content-agnostic.
 
-Both strategies share the same post-processing (whitespace cleanup,
-overlap, tiny-chunk merging) so they're interchangeable from the
-pipeline's point of view.
+* ``llm`` — LLM-assisted. Passes sliding passages through the LLM to
+  identify semantic break-points in free-form, unstructured text.
+  Significantly slower than the other two strategies; requires a working
+  LLM pipeline and a GPU driver that handles the token budget set in
+  ``chunking.llm_max_tokens`` without stalling (driver 26.18+ recommended).
+  Only use this when ``semantic`` genuinely produces poor chunks.
+
+All three strategies share the same post-processing (whitespace cleanup,
+overlap, tiny-chunk merging).
 """
 
 from __future__ import annotations
@@ -52,17 +57,38 @@ class SemanticChunker:
     (recursive) splitting based on ``config.chunking.strategy``.
     """
 
-    def __init__(self, embedding_component) -> None:
+    def __init__(self, embedding_component, llm_generate_fn=None) -> None:
+        """
+        Parameters
+        ----------
+        embedding_component:
+            Object with ``embed_documents(texts) -> list[list[float]]``.
+        llm_generate_fn:
+            Optional callable ``(prompt: str, max_tokens: int) -> str``.
+            Required only when ``chunking.strategy = llm``; ignored otherwise.
+        """
         cfg = config.chunking
-        self.strategy = str(getattr(cfg, "strategy", "semantic")).lower()
+        self.strategy = str(getattr(cfg, "strategy", "llm")).lower()
         self.max_chunk_chars = int(getattr(cfg, "max_chunk_chars", 1200))
         self.min_chunk_chars = int(getattr(cfg, "min_chunk_chars", 200))
         self.overlap_chars = int(getattr(cfg, "overlap_chars", 150))
         self.similarity_threshold = float(getattr(cfg, "semantic_similarity_threshold", 0.72))
         self.embedding_component = embedding_component
+        self._llm_generate = llm_generate_fn
 
-        if self.strategy not in {"semantic", "fixed"}:
+        # LLM strategy config
+        llm_cfg = getattr(cfg, "llm", None)
+        self._llm_passage_chars = int(getattr(llm_cfg, "passage_chars", 4000) if llm_cfg else 4000)
+        self._llm_max_tokens = int(getattr(llm_cfg, "max_tokens", 512) if llm_cfg else 512)
+
+        if self.strategy not in {"semantic", "fixed", "llm"}:
             logger.warning("Unknown chunking strategy %r; falling back to 'semantic'", self.strategy)
+            self.strategy = "semantic"
+
+        if self.strategy == "llm" and self._llm_generate is None:
+            logger.warning(
+                "chunking.strategy=llm but no LLM function provided; falling back to 'semantic'"
+            )
             self.strategy = "semantic"
 
     # ------------------------------------------------------------------
@@ -82,6 +108,8 @@ class SemanticChunker:
 
         if self.strategy == "fixed":
             chunks = self._fixed_size(normalized)
+        elif self.strategy == "llm":
+            chunks = self._llm(normalized)
         else:
             chunks = self._semantic(normalized)
 
@@ -183,6 +211,115 @@ class SemanticChunker:
         if buf:
             chunks.append(buf)
         return [c for c in chunks if c.strip()]
+
+    # ------------------------------------------------------------------
+    # Strategy 3: LLM-assisted split (line-marker approach)
+    # ------------------------------------------------------------------
+    _LLM_MARKER_PROMPT = (
+        "You are a document segmenter. "
+        "The text below has been split into numbered lines. "
+        "Output ONLY a compact JSON array of 1-based integer line numbers where a new semantic chunk "
+        "should START. Always include line 1. Example output: [1, 5, 12]. "
+        "Do not include any commentary, keys, or markdown fences.\n\n"
+        "Numbered lines:\n{numbered}\n\n"
+        "JSON array of chunk start line numbers:"
+    )
+
+    def _llm(self, text: str) -> list[str]:
+        """Send overlapping passages to the LLM and ask it to identify chunk
+        boundaries as 1-based line-number markers. Falls back to ``_semantic``
+        on any error or malformed response.
+
+        Requesting line-number markers instead of regenerated text avoids
+        hallucination, keeps the output token budget tiny (a short integer
+        array regardless of passage length), and guarantees the original text
+        is preserved verbatim. The passage size is controlled by
+        ``chunking.llm.passage_chars`` (default 4000) and the generation cap
+        by ``chunking.llm.max_tokens`` (default 512).
+        """
+        passages = self._sliding_passages(text, self._llm_passage_chars)
+        chunks: list[str] = []
+        seen: set[str] = set()
+
+        for passage in passages:
+            lines, numbered = self._number_lines(passage)
+            prompt = self._LLM_MARKER_PROMPT.format(numbered=numbered)
+            try:
+                raw = self._llm_generate(prompt, self._llm_max_tokens)
+                markers = self._parse_line_markers(raw, len(lines))
+                if not markers:
+                    raise ValueError("no valid line markers in LLM response")
+                for c in self._split_by_line_markers(lines, markers):
+                    if c not in seen:
+                        seen.add(c)
+                        chunks.append(c)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[chunker] LLM split failed for passage, falling back to semantic: %s", exc)
+                for c in self._semantic(passage):
+                    if c not in seen:
+                        seen.add(c)
+                        chunks.append(c)
+
+        return chunks or self._semantic(text)
+
+    @staticmethod
+    def _number_lines(text: str) -> tuple[list[str], str]:
+        """Return ``(lines, numbered_text)`` with 1-based line-number prefixes."""
+        lines = text.split("\n")
+        numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+        return lines, numbered
+
+    @staticmethod
+    def _parse_line_markers(raw: str, n_lines: int) -> list[int]:
+        """Parse a JSON array of 1-based start-line indices from LLM output.
+
+        Returns an empty list if parsing fails or the array contains no valid
+        indices — callers should treat that as a signal to fall back.
+        """
+        import json
+
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        if start == -1 or end == 0:
+            return []
+        try:
+            items = json.loads(raw[start:end])
+            if not isinstance(items, list):
+                return []
+            return sorted(
+                {int(x) for x in items if isinstance(x, (int, float)) and 1 <= int(x) <= n_lines}
+            )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return []
+
+    @staticmethod
+    def _split_by_line_markers(lines: list[str], markers: list[int]) -> list[str]:
+        """Split *lines* into chunks that start at each 1-based *marker* index.
+
+        Line 1 is always treated as a start even if absent from *markers*.
+        """
+        starts = sorted({1} | set(markers))
+        chunks: list[str] = []
+        for i, start_ln in enumerate(starts):
+            end_ln = starts[i + 1] if i + 1 < len(starts) else len(lines) + 1
+            chunk = "\n".join(lines[start_ln - 1 : end_ln - 1]).strip()
+            if chunk:
+                chunks.append(chunk)
+        return chunks
+
+    @staticmethod
+    def _sliding_passages(text: str, passage_chars: int) -> list[str]:
+        """Split text into overlapping passages that fit in ``passage_chars``."""
+        if len(text) <= passage_chars:
+            return [text]
+        overlap = passage_chars // 8
+        step = passage_chars - overlap
+        passages: list[str] = []
+        i = 0
+        while i < len(text):
+            passages.append(text[i : i + passage_chars])
+            i += step
+        return passages
 
     # ------------------------------------------------------------------
     # Shared helpers

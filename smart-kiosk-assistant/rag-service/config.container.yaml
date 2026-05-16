@@ -1,8 +1,17 @@
 # Container override — applied on top of config.yaml when running in Docker.
 # Activated via SMART_KIOSK_RAG_CONFIG_OVERRIDE_PATHS in docker-compose.yml.
+# Only keys that differ from config.yaml are listed here.
 
 retrieval:
   # 8000 chars ≈ 2300 tokens. With system prompt + question (~300 tokens)
   # the total prompt is ~2600 tokens, safely within the 5k iGPU limit on
-  # Linux with Intel compute-runtime 26.18+ (installed via Dockerfile).
+  # Linux with Intel compute-runtime 26.18+ (installed on the host).
   max_context_chars: 8000
+
+# Uncomment to switch to LLM-assisted chunking in the container
+# (requires driver 26.18+ on the host; much slower ingest):
+# chunking:
+#   strategy: llm
+#   llm:
+#     passage_chars: 4000
+#     max_tokens: 512

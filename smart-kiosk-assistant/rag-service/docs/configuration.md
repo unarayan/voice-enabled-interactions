@@ -61,21 +61,30 @@ For example, `config.container.yaml` only sets the keys that differ from
 
 | Key | Default | Description |
 |---|---|---|
-| `strategy` | `semantic` | `semantic` (embedding-based, header-aware) or `fixed` (recursive char split) |
+| `strategy` | `semantic` | `semantic`, `fixed`, or `llm` (see below) |
 | `max_chunk_chars` | `1200` | Upper bound per chunk |
 | `min_chunk_chars` | `200` | Tiny-chunk merge threshold |
 | `overlap_chars` | `150` | Character overlap added between adjacent chunks |
 | `semantic_similarity_threshold` | `0.72` | Cosine boundary for the `semantic` strategy |
+| `llm.passage_chars` | `4000` | Chars per passage sent to the LLM (`llm` strategy only) |
+| `llm.max_tokens` | `512` | Max new tokens the LLM may generate per passage (`llm` strategy only) |
 
 ### Picking a strategy
 
 * **`semantic`** — Best for narrative or mixed content. Honors markdown
   headers as hard boundaries, then uses embedding similarity to detect
-  topic shifts inside each section. Embedding runs on CPU; ingest is
-  GPU-free.
+  topic shifts. Embedding runs on CPU; ingest is GPU-free.
 * **`fixed`** — Deterministic recursive split on paragraph → line →
   sentence → word boundaries. Best for tabular or code-like content,
   or when you want fully reproducible chunking.
+* **`llm`** — LLM-assisted. The LLM reads each passage and identifies
+  semantic break-points. Best for dense, unstructured free-form text where
+  neither headers nor sentence similarity gives good boundaries.
+  **Significantly slower** than the other two strategies and requires the
+  LLM to be available during ingest. Requires driver 26.18+ to avoid
+  GPU stalls (see README). Enable by setting `chunking.strategy: llm` and
+  tuning `chunking.llm.passage_chars` to keep token usage inside the
+  GPU ceiling (`passage_chars / 4 ≈ rough token estimate`).
 
 ## `answering`
 

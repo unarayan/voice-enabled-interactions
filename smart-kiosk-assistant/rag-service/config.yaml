@@ -36,11 +36,19 @@ retrieval:
 
 chunking:
   # "semantic" (embedding-based, header-aware) | "fixed" (recursive char split)
-  strategy: "semantic"
+  # | "llm" (LLM-assisted — slow, needs driver 26.18+, use only for unstructured corpora)
+  strategy: "llm"
   max_chunk_chars: 1200
   min_chunk_chars: 200
   overlap_chars: 150
   semantic_similarity_threshold: 0.72
+  # LLM chunking settings — only used when strategy: llm
+  llm:
+    # Characters per passage sent to the LLM. Keep well below the GPU token ceiling.
+    # passage_chars / 4 ≈ rough token estimate. 4000 chars ≈ 1000 tokens.
+    passage_chars: 4000
+    # Max new tokens the LLM may generate per passage (JSON array of chunks).
+    max_tokens: 512
 
 answering:
   system_prompt: |

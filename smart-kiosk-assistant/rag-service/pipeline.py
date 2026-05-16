@@ -114,8 +114,16 @@ class RagPipeline:
         ensure_llm_model()
 
         # Embedding + chunker (CPU, cheap to keep loaded).
+        # Pass the LLM generate function only when strategy=llm; it uses the
+        # same pipeline that answers questions, so the LLM must be loaded first.
         self.embedding_component = EmbeddingComponent()
-        self.chunker = SemanticChunker(self.embedding_component)
+        self._plugin_config = self._build_plugin_config(config.models.llm)
+        self._llm_lock = threading.RLock()
+        self._llm = self._load_llm()
+
+        chunking_strategy = str(getattr(config.chunking, "strategy", "llm")).lower()
+        llm_fn = self._chunker_llm_fn if chunking_strategy == "llm" else None
+        self.chunker = SemanticChunker(self.embedding_component, llm_generate_fn=llm_fn)
 
         # Vector store
         store_cfg = config.storage
@@ -135,16 +143,12 @@ class RagPipeline:
         self.score_threshold = getattr(retr_cfg, "score_threshold", None)
         self.include_source_markers = bool(getattr(config.answering, "include_source_markers", False))
 
-        # LLM params + tokenizer + pipeline
+        # LLM params
         llm_cfg = config.models.llm
         self.device = str(getattr(llm_cfg, "device", "CPU")).upper()
         self._model_path = get_llm_model_path()
         self._temperature = float(getattr(llm_cfg, "temperature", 0.0))
         self._default_max_new_tokens = int(getattr(config.answering, "max_tokens", 192))
-
-        self._plugin_config = self._build_plugin_config(llm_cfg)
-        self._llm_lock = threading.RLock()
-        self._llm = self._load_llm()
 
     # ----- LLM lifecycle ------------------------------------------------
     def _build_plugin_config(self, llm_cfg) -> dict[str, str]:
@@ -188,6 +192,11 @@ class RagPipeline:
     def _is_resource_error(exc: Exception) -> bool:
         message = str(exc).upper()
         return any(m in message for m in _RESOURCE_ERROR_MARKERS)
+
+    def _chunker_llm_fn(self, prompt: str, max_tokens: int) -> str:
+        """Thin wrapper that lets the chunker call the LLM without knowing
+        about locks or generation kwargs."""
+        return self._generate(prompt, max_tokens=max_tokens, temperature=0.0)
 
     # ----- Ingest -------------------------------------------------------
     def ingest_text(self, text: str, source: str = "api", metadata: dict | None = None) -> int:
