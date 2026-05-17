@@ -36,13 +36,13 @@ retrieval:
   score_threshold: null
 
 chunking:
-  max_chunk_chars: 1500
+  max_chunk_chars: 2000
   min_chunk_chars: 200
   overlap_chars: 200
   semantic_similarity_threshold: 0.72
-  llm_passage_chars: 10000
-  llm_passage_tokens: 3000      # wide enough to keep a full semantic intact before LLM splits it
-  llm_passage_overlap_tokens: 300
+  llm_passage_chars: 17000
+  llm_passage_tokens: 5000      # wide enough to keep a full semantic intact before LLM splits it
+  llm_passage_overlap_tokens: 500
   save_chunks_debug: "./storage/chunks_debug"  # set to null to disable
 
 answering:
@@ -56,4 +56,4 @@ answering:
   # Proactively recycle the OpenVINO LLMPipeline after this many generate()
   # calls to release iGPU KV/working memory and avoid CL_OUT_OF_RESOURCES.
   # Set to 0 to disable proactive recycling (only on-error recycling will run).
-  max_generations_before_reload: 15
+  max_generations_before_reload: 2

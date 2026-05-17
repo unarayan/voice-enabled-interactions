@@ -1,4 +1,4 @@
-FROM openvino/ubuntu24_runtime:2025.4.0
+FROM openvino/ubuntu24_runtime:2026.1.0
 
 USER root
 
