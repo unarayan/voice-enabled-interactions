@@ -10,7 +10,7 @@ api:
 
 models:
   llm:
-    hf_id: "Qwen/Qwen2.5-7B-Instruct"
+    hf_id: "OpenVINO/Qwen2.5-7B-Instruct-int8-ov"
     device: "GPU"
     weight_format: "int8"
     models_base_path: "./models/llm"
@@ -19,6 +19,16 @@ models:
     # skips kernel compilation (first load is normal, subsequent reloads are
     # ~few seconds instead of ~minute). Set to null/empty to disable.
     cache_dir: "./storage/ov_cache"
+    # ── OVMS mode ─────────────────────────────────────────────────────────
+    # When ovms_url is set, the rag-service delegates ALL LLM generation to
+    # the OVMS container instead of loading ov_genai in-process.  This keeps
+    # ~8 GB of model weights in the OVMS process, freeing shared RAM for the
+    # embedding model and ChromaDB.
+    # Start the OVMS service alongside rag-service (see docker-compose.yml)
+    # then enable by setting the URL.  Comment out to revert to in-process.
+    ovms_url: "http://ovms-service:8028"
+    ovms_model_name: "qwen25_7b_int8"
+    ovms_request_timeout: 300
   embedding:
     hf_id: "BAAI/bge-large-en-v1.5"
     device: "CPU"

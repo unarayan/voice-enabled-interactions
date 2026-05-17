@@ -1,4 +1,37 @@
 services:
+  # ── OVMS: LLM inference in a dedicated process ─────────────────────────────
+  # The text-generation pipeline uses continuous batching (PagedAttention) and
+  # keeps the 8 GB model in the OVMS process, freeing shared RAM for rag-service.
+  ovms-service:
+    image: openvino/model_server:latest-gpu
+    container_name: ovms-service
+    restart: unless-stopped
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - "992" # render gid on Intel ARL host – needed for /dev/dri/renderD128
+    ports:
+      - "8028:8028" # REST (chat/completions)
+      - "9128:9128" # gRPC
+    volumes:
+      # Mount model at /repo/<model_name>: OVMS 2026.x pull-mode writes graph.pbtxt
+      # here and expects model files at the same path.  No :ro – OVMS must write.
+      - ./models/llm/OpenVINO_Qwen2.5-7B-Instruct-int8-ov__int8:/repo/qwen25_7b_int8
+      - ./storage/ov_cache:/tmp/ov_cache
+    command: >
+      --model_repository_path /repo --model_name qwen25_7b_int8 --task text_generation --target_device GPU --plugin_config '{"CACHE_DIR":"/tmp/ov_cache","INFERENCE_PRECISION_HINT":"f16","KV_CACHE_PRECISION":"f16","NUM_STREAMS":"1","COMPILATION_NUM_THREADS":"1"}' --cache_size 4 --max_num_batched_tokens 8192 --dynamic_split_fuse true --rest_port 8028 --port 9128
+    # OVMS model server memory: model ~8 GB + KV cache ~4 GB + overhead ~1 GB
+    mem_limit: 16g
+    memswap_limit: 16g
+    healthcheck:
+      # /health returns 400 on OVMS 2026.x; /v3/models returns 200 when ready
+      test: [ "CMD", "curl", "-sf", "http://localhost:8028/v3/models" ]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 600s
+
   rag-service:
     build:
       context: .
@@ -10,9 +43,26 @@ services:
       - /dev/dri:/dev/dri
     group_add:
       - video
+    # Hard cap prevents a runaway LLM allocation from OOM-killing the whole host.
+    # In OVMS mode: ~1.5 GB embedding + ~2 GB Python/ChromaDB/uvicorn (no in-process LLM).
+    # In direct mode: add ~8 GB for Qwen 7B int8 model buffers on GPU (shared RAM).
+    mem_limit: 32g
+    memswap_limit: 32g
+    depends_on:
+      ovms-service:
+        condition: service_healthy
     environment:
       SMART_KIOSK_RAG_CONFIG_OVERRIDE_PATHS: /app/rag-service/config.container.yaml
+      # Ensure container-internal hostnames bypass the corporate proxy
+      no_proxy: "localhost,127.0.0.1,ovms-service,*.intel.com,10.*,134.*"
+      NO_PROXY: "localhost,127.0.0.1,ovms-service,*.intel.com,10.*,134.*"
+      # Tell glibc to mmap (and thus return to OS) any allocation >= 12.5 MB
+      # instead of holding it in the heap.  Keeps the heap from growing
+      # unboundedly as large OpenVINO weight tensors are allocated/freed.
       MALLOC_MMAP_THRESHOLD_: "13107200"
+      # Trim the heap after every free of >= 12.5 MB, returning pages to the OS.
+      # Pairs with MALLOC_MMAP_THRESHOLD_ to stabilise VMRSS between inferences.
+      MALLOC_TRIM_THRESHOLD_: "13107200"
     volumes:
       - ./config.container.yaml:/app/rag-service/config.container.yaml:ro
       - ./models:/app/rag-service/models

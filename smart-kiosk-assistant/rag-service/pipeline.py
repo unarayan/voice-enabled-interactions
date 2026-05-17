@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import gc
 import logging
 import pathlib
@@ -13,12 +14,12 @@ from typing import Generator
 import openvino_genai as ov_genai
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from transformers import AutoTokenizer
 
 from components.chunker_component import SemanticChunker
 from components.embedding_component import EmbeddingComponent
 from utils.config_loader import config
 from utils.ensure_model import ensure_llm_model, get_llm_model_path
+from utils.ovms_client import OvmsLlmClient
 
 
 logger = logging.getLogger(__name__)
@@ -26,72 +27,55 @@ logger = logging.getLogger(__name__)
 _SHARED_PIPELINE: "RagPipeline | None" = None
 _SHARED_PIPELINE_LOCK = threading.Lock()
 
+# Cache the libc handle once for periodic malloc_trim(0) calls.
+# malloc_trim(0) asks glibc to release all free arenas back to the OS;
+# this is the same function recommended in the OpenVINO memory-usage docs.
+try:
+    _libc: ctypes.CDLL | None = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:
+    _libc = None
+
+
+def _malloc_trim() -> None:
+    """Release free glibc memory arenas back to the OS (Linux only, no-op elsewhere)."""
+    if _libc is not None:
+        _libc.malloc_trim(0)
+
 
 # ---------------------------------------------------------------------------
-# Streaming helper — matches the smart-classroom ov_genai_util pattern exactly,
-# using put() which is the correct openvino_genai.StreamerBase interface.
+# Token streaming — callable-based, no HF tokenizer needed.
+#
+# ov_genai.LLMPipeline.generate(streamer=<callable>) accepts any callable
+# ``(chunk: str) -> bool``. Returning False keeps generation running.
+# Received chunks are already decoded text, so no separate tokenizer is
+# required. This saves the ~500 MB that AutoTokenizer.from_pretrained() would
+# otherwise allocate from the iGPU's shared system RAM.
 # ---------------------------------------------------------------------------
-class YieldingTextStreamer(ov_genai.StreamerBase):
-    def __init__(self, tokenizer, skip_special_tokens: bool = True) -> None:
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.skip_special_tokens = skip_special_tokens
+class _TokenStream:
+    """Producer/consumer queue bridging ov_genai streamer callback → generator."""
+
+    def __init__(self) -> None:
         self._queue: queue.Queue[str | None] = queue.Queue()
-        self._token_cache: list[int] = []
-        self._print_len = 0
+        self._ended = False
         self._exc: Exception | None = None
-        self._ended = False  # FIX: guard against double end()
 
-    def put(self, token_id: int) -> bool:
-        self._token_cache.append(token_id)
-        text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
-        new_text = text[self._print_len:]
-        if not new_text:
-            return False
-        if self._is_safe_to_emit(new_text):
-            self._queue.put(new_text)
-            self._print_len = len(text)
-        else:
-            last_token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-            if last_token_text.startswith(" "):
-                prev_chunk = text[self._print_len: len(text) - len(last_token_text)]
-                if prev_chunk:
-                    self._queue.put(prev_chunk)
-                    self._print_len += len(prev_chunk)
-        return False
+    def __call__(self, chunk: str) -> bool:
+        if chunk:
+            self._queue.put(chunk)
+        return False  # keep generating
 
     def end(self) -> None:
-        # FIX: ov_genai may call end() internally; guard against double-call
-        # to avoid pushing two None sentinels which corrupts the iterator.
         if self._ended:
             return
         self._ended = True
-        if self._token_cache:
-            text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
-            remaining = text[self._print_len:]
-            if remaining:
-                self._queue.put(remaining)
         self._queue.put(None)
-        self._token_cache.clear()
-        self._print_len = 0
 
     def __iter__(self):
         while True:
-            token = self._queue.get()
-            if token is None:
+            item = self._queue.get()
+            if item is None:
                 break
-            yield token
-
-    @staticmethod
-    def _is_safe_to_emit(text: str) -> bool:
-        last = text[-1]
-        cp = ord(last)
-        return (
-            last.isspace()
-            or last == "\n"
-            or last in {".", ",", "!", "?", ";", ":"}
-            or 0x4E00 <= cp <= 0x9FFF  # CJK
-        )
+            yield item
 
 
 class ChromaEmbeddingAdapter:
@@ -161,6 +145,12 @@ class RagPipeline:
                 self._plugin_config,
             )
 
+        # Limit compilation parallelism (all devices). Kernel compilation can
+        # spike peak RAM to 2-3x the model's inference footprint when many
+        # threads compile simultaneously; serialising at 1 thread trades
+        # load-time speed for a flat, predictable memory profile.
+        self._plugin_config["COMPILATION_NUM_THREADS"] = "1"
+
         cache_dir = getattr(llm_cfg, "cache_dir", None)
         if cache_dir:
             cache_path = pathlib.Path(cache_dir).expanduser().resolve()
@@ -168,27 +158,42 @@ class RagPipeline:
             self._plugin_config["CACHE_DIR"] = str(cache_path)
             logger.info("[LLM] OpenVINO model cache enabled at %s", cache_path)
 
-        # Tokenizer and pipeline are loaded once at startup and shared behind a lock.
-        logger.info(
-            "Loading HF tokenizer for %s (model path: %s, device: %s)",
-            llm_cfg.hf_id, self._model_path, self._device,
-        )
-        try:
-            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, fix_mistral_regex=True)
-        except TypeError:
-            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path)
-        self._llm_lock = threading.RLock()
-        self._llm = self._load_llm()
+        # ── OVMS mode: if llm.ovms_url is set, delegate generation to an
+        # external OVMS container instead of loading ov_genai in-process.
+        # This keeps the LLM memory in the OVMS process, freeing RAM for the
+        # rag-service's embedding / ChromaDB workload.
+        _ovms_url = str(getattr(llm_cfg, "ovms_url", "") or "").strip()
+        self._ovms_client: OvmsLlmClient | None = None
+        if _ovms_url:
+            _ovms_model_name = str(getattr(llm_cfg, "ovms_model_name", "qwen25_7b_int8"))
+            _ovms_timeout = float(getattr(llm_cfg, "ovms_request_timeout", 300))
+            self._ovms_client = OvmsLlmClient(
+                base_url=_ovms_url,
+                model_name=_ovms_model_name,
+                request_timeout=_ovms_timeout,
+            )
+            if not self._ovms_client.health_check():
+                logger.warning(
+                    "[LLM] OVMS at %s did not respond to /v3/models — requests may fail until it starts",
+                    _ovms_url,
+                )
+            logger.info(
+                "[LLM] OVMS mode enabled → %s  model=%s",
+                _ovms_url, _ovms_model_name,
+            )
 
-        # FIX: Use a dedicated wrapper with capped max_new_tokens for chunking.
-        # The chunker only needs short completions (section titles, boundaries),
-        # so passing max_tokens=None → _default_max_new_tokens was wasteful and
-        # caused the LLMPipeline to pre-allocate large KV cache on first call,
-        # triggering CL_OUT_OF_RESOURCES on iGPU before any real work happened.
+        # Load the LLM pipeline. ov_genai includes its own tokenizer — we do
+        # NOT load a separate HF AutoTokenizer, saving ~500 MB of shared RAM.
+        # The chunker falls back to char-based passage splitting (llm_passage_chars)
+        # when llm_tokenizer=None, which is accurate enough for this use case.
+        # In OVMS mode the in-process pipeline is NOT loaded (saves ~8 GB RAM).
+        self._llm_lock = threading.RLock()
+        self._llm = None if self._ovms_client else self._load_llm()
+
         self.chunker = SemanticChunker(
             self.embedding_component,
             self._chunker_generate,
-            llm_tokenizer=self._tokenizer,
+            llm_tokenizer=None,
         )
 
     def _chunker_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
@@ -217,19 +222,16 @@ class RagPipeline:
             return ov_genai.LLMPipeline(self._model_path, self._device, **self._plugin_config)
         return ov_genai.LLMPipeline(self._model_path, self._device)
 
-    def _destroy_llm(self, model: ov_genai.LLMPipeline) -> None:
-        try:
-            del model
-            gc.collect()
-            logger.info("[LLM] Pipeline destroyed, memory reclaimed")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[LLM] Failed to fully destroy pipeline: %s", exc)
-
     def close(self) -> None:
+        self._ovms_client = None  # just drop the HTTP client reference
         with self._llm_lock:
             if getattr(self, "_llm", None) is not None:
-                self._destroy_llm(self._llm)
+                old = self._llm
                 self._llm = None
+                del old
+                gc.collect()  # effective: self._llm reference already dropped
+                _malloc_trim()  # return freed arenas to OS immediately
+                logger.info("[LLM] Pipeline destroyed, memory reclaimed")
 
     @staticmethod
     def _is_resource_exhaustion(exc: Exception) -> bool:
@@ -246,8 +248,12 @@ class RagPipeline:
 
     def _reload_llm_locked(self) -> None:
         if getattr(self, "_llm", None) is not None:
-            self._destroy_llm(self._llm)
-            self._llm = None
+            old = self._llm
+            self._llm = None  # drop reference before gc so collect is effective
+            del old
+            gc.collect()
+            _malloc_trim()  # return freed arenas to OS before loading new pipeline
+            logger.info("[LLM] Pipeline destroyed, memory reclaimed")
         self._llm = self._load_llm()
         self._generations_since_reload = 0
 
@@ -255,13 +261,15 @@ class RagPipeline:
         """Run cleanup after a successful generation while holding _llm_lock.
 
         Increments the generation counter, runs gc.collect to release Python
-        references to intermediate tensors, and recycles the LLMPipeline once
-        the configured threshold is reached to avoid GPU memory fragmentation
+        references to intermediate tensors, calls malloc_trim to return freed
+        glibc arenas back to the OS, and recycles the LLMPipeline once the
+        configured threshold is reached to avoid GPU memory fragmentation
         / KV cache buildup that eventually triggers CL_OUT_OF_RESOURCES.
         """
         self._generations_since_reload += 1
         try:
             gc.collect()
+            _malloc_trim()  # release glibc free arenas to OS after each inference
         except Exception:  # noqa: BLE001
             pass
         if (
@@ -469,6 +477,12 @@ class RagPipeline:
     def _generate_text(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
         gen_kwargs = self._generation_kwargs(max_tokens=max_tokens, temperature=temperature)
 
+        # ── OVMS path ──────────────────────────────────────────────────────
+        if self._ovms_client is not None:
+            logger.debug("[LLM] OVMS generate | max_new_tokens=%s", gen_kwargs.get("max_new_tokens"))
+            return self._ovms_client.generate(prompt, **gen_kwargs)  # type: ignore[return-value]
+
+        # ── in-process ov_genai path ───────────────────────────────────────
         with self._llm_lock:
             try:
                 result = self._llm.generate(prompt, **gen_kwargs)
@@ -484,16 +498,29 @@ class RagPipeline:
     def _stream_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> Generator[str, None, None]:
         gen_kwargs = self._generation_kwargs(max_tokens=max_tokens, temperature=temperature)
 
-        streamer = YieldingTextStreamer(self._tokenizer)
+        # ── OVMS streaming path ────────────────────────────────────────────
+        if self._ovms_client is not None:
+            logger.debug("[LLM] OVMS stream | max_new_tokens=%s", gen_kwargs.get("max_new_tokens"))
+            streamer = _TokenStream()
+
+            def _run_ovms_stream() -> None:
+                try:
+                    self._ovms_client.generate(prompt, streamer=streamer, **gen_kwargs)  # type: ignore[union-attr]
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("[LLM] OVMS stream failed: %s", exc)
+                    streamer._exc = exc
+                    streamer.end()
+
+            threading.Thread(target=_run_ovms_stream, daemon=True).start()
+            yield from streamer
+            if streamer._exc:
+                raise streamer._exc
+            return
+
+        # ── in-process ov_genai streaming path ────────────────────────────
+        streamer = _TokenStream()
 
         def _run_generation() -> None:
-            # FIX: Do NOT call streamer.end() in finally — ov_genai calls it
-            # internally when generation completes normally. Calling it again
-            # pushed a second None sentinel into the queue, which either caused
-            # the iterator to stop one token early or (in some OV builds) triggered
-            # a second forward pass leading to a spurious OOM on the GPU.
-            # We only manually signal end() in the error path where ov_genai
-            # may not have had a chance to call it itself.
             try:
                 with self._llm_lock:
                     try:
