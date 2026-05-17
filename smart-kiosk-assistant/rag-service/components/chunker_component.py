@@ -115,6 +115,17 @@ class SemanticChunker:
             logger.info("[CHUNKER] Passage %d/%d | preview: %r", p_idx, total, passage[:200])
 
             prompt = self._build_marker_prompt(numbered, profile, len(lines))
+            prompt_chars = len(prompt)
+            prompt_tokens: int | None = None
+            if self.llm_tokenizer is not None:
+                try:
+                    prompt_tokens = len(self.llm_tokenizer.encode(prompt))
+                except Exception:  # noqa: BLE001
+                    pass
+            logger.info(
+                "[CHUNKER] Passage %d/%d | prompt_chars=%d | prompt_tokens=%s | max_new_tokens=%d",
+                p_idx, total, prompt_chars, prompt_tokens, self._MARKER_MAX_TOKENS,
+            )
             t0 = time.monotonic()
 
             try:

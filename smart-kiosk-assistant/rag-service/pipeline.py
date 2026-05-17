@@ -354,7 +354,11 @@ class RagPipeline:
 
     def _generate_text(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
         gen_kwargs = self._generation_kwargs(max_tokens=max_tokens, temperature=temperature)
-
+        t0 = time.monotonic()
+        logger.info(
+            "[LLM] _generate_text | prompt_chars=%d | max_tokens=%s | temperature=%s",
+            len(prompt), max_tokens, temperature,
+        )
         with self._llm_lock:
             try:
                 result = self._llm.generate(prompt, **gen_kwargs)
@@ -365,6 +369,10 @@ class RagPipeline:
                 self._reload_llm_locked()
                 result = self._llm.generate(prompt, **gen_kwargs)
             self._post_generation_locked()
+        logger.info(
+            "[LLM] _generate_text | done | result_chars=%d | elapsed=%.2fs",
+            len(result), time.monotonic() - t0,
+        )
         return result
 
     def _stream_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> Generator[str, None, None]:
