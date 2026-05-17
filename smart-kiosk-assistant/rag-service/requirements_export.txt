@@ -1,0 +1,31 @@
+# Export-time dependencies for OpenVINO IR export of Qwen2.5-7B-Instruct
+# Used by: export_model.py  (ensure_model / optimum-cli path)
+# Python 3.12 required
+
+# ── OpenVINO inference stack ─────────────────────────────────────────────────
+openvino==2026.1.0
+openvino-genai==2026.1.0.0
+openvino-tokenizers
+openvino-telemetry==2025.2.0
+
+# ── Export toolchain ─────────────────────────────────────────────────────────
+optimum==1.26.1
+optimum-intel==1.24.0          # provides optimum-cli export openvino
+nncf==2.19.0                   # required for int8 weight compression during export
+
+# ── HuggingFace / model loading ──────────────────────────────────────────────
+torch==2.8.0                   # CPU-only is fine for export; no CUDA required
+transformers==4.52.4
+tokenizers==0.21.4
+huggingface-hub==0.34.4
+safetensors==0.6.2
+accelerate>=0.26.0             # needed by optimum for model loading
+
+# ── Misc runtime deps ────────────────────────────────────────────────────────
+numpy==1.26.4
+fsspec>=2023.1.0,<=2026.4.0
+filelock
+tqdm
+PyYAML==6.0.3
+regex
+packaging

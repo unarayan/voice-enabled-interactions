@@ -5,7 +5,8 @@ USER root
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/root/.cache/huggingface
+    HF_HOME=/root/.cache/huggingface \
+    MALLOC_MMAP_THRESHOLD_=13107200
 
 WORKDIR /app/rag-service
 

@@ -12,6 +12,7 @@ services:
       - video
     environment:
       SMART_KIOSK_RAG_CONFIG_OVERRIDE_PATHS: /app/rag-service/config.container.yaml
+      MALLOC_MMAP_THRESHOLD_: "13107200"
     volumes:
       - ./config.container.yaml:/app/rag-service/config.container.yaml:ro
       - ./models:/app/rag-service/models
