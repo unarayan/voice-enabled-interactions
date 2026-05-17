@@ -11,7 +11,6 @@ from utils.config_loader import config
 
 
 logger = logging.getLogger(__name__)
-_WEIGHT_FORMATS = {"fp32", "fp16", "int8", "int4"}
 _SERVICE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -37,22 +36,13 @@ def _llm_model_exists(output_dir: str) -> bool:
     )
 
 
-def _llm_tokenizer_exists(output_dir: str) -> bool:
-    required = (
-        "openvino_tokenizer.xml",
-        "openvino_tokenizer.bin",
-        "openvino_detokenizer.xml",
-        "openvino_detokenizer.bin",
-    )
-    return all(
-        os.path.isfile(os.path.join(output_dir, name))
-        and os.path.getsize(os.path.join(output_dir, name)) > 0
-        for name in required
-    )
+def _llm_hf_tokenizer_exists(output_dir: str) -> bool:
+    """Check that HuggingFace tokenizer files are present (needed by OVModelForCausalLM)."""
+    return os.path.isfile(os.path.join(output_dir, "tokenizer_config.json"))
 
 
 def _llm_export_ready(output_dir: str) -> bool:
-    return _llm_model_exists(output_dir) and _llm_tokenizer_exists(output_dir)
+    return _llm_model_exists(output_dir) and _llm_hf_tokenizer_exists(output_dir)
 
 
 def _download_repo(repo_id: str, output_dir: str) -> str:
@@ -71,72 +61,36 @@ def _reset_output_dir(output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
 
-def _export_openvino_tokenizer(model_name: str, output_dir: str) -> None:
-    try:
-        from openvino import save_model
-        from openvino_tokenizers import convert_tokenizer
-        from transformers import AutoTokenizer
-    except ImportError as exc:
-        raise RuntimeError(
-            "Tokenizer export dependencies are not available. Install OpenVINO tokenizer conversion support."
-        ) from exc
-
-    logger.info("Exporting tokenizer IR for %s into %s", model_name, output_dir)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    converted = convert_tokenizer(tokenizer, with_detokenizer=True)
-    if isinstance(converted, tuple):
-        ov_tokenizer, ov_detokenizer = converted
-    else:
-        ov_tokenizer = converted
-        ov_detokenizer = None
-
-    save_model(ov_tokenizer, os.path.join(output_dir, "openvino_tokenizer.xml"))
-    if ov_detokenizer is not None:
-        save_model(ov_detokenizer, os.path.join(output_dir, "openvino_detokenizer.xml"))
-
-    if not _llm_tokenizer_exists(output_dir):
-        raise RuntimeError(
-            f"Tokenizer export failed for {model_name}: OpenVINO tokenizer IR is incomplete in {output_dir}"
-        )
-
-
 def _export_openvino_model(
     model_name: str,
     output_dir: str,
-    weight_format: str,
-    task: str | None = None,
+    precision: str = "int8",
 ) -> str:
-    if weight_format not in _WEIGHT_FORMATS:
-        raise ValueError(f"Unsupported OpenVINO weight format: {weight_format}")
-
     _reset_output_dir(output_dir)
     logger.info(
-        "Exporting %s → %s via main_export (task=%s, weight_format=%s)",
+        "Exporting %s → %s via main_export (precision=%s)",
         model_name,
         output_dir,
-        task or "text-generation-with-past",
-        weight_format,
+        precision,
     )
     main_export(
         model_name_or_path=model_name,
         output=output_dir,
-        task=task or "text-generation-with-past",
-        trust_remote_code=True,
-        weight_format=weight_format,
+        precision=precision,
     )
     if not _llm_model_exists(output_dir):
         raise RuntimeError(
             f"OpenVINO export failed for {model_name}: main_export did not produce a valid IR in {output_dir}"
         )
-    _export_openvino_tokenizer(model_name, output_dir)
     return output_dir
 
 
 def get_llm_model_path() -> str:
     llm_cfg = config.models.llm
+    precision = getattr(llm_cfg, "weight_format", "int8")
     return os.path.join(
         _resolve_service_path(llm_cfg.models_base_path),
-        _slugify(llm_cfg.hf_id, getattr(llm_cfg, "weight_format", "int8")),
+        _slugify(llm_cfg.hf_id, precision),
     )
 
 
@@ -158,19 +112,13 @@ def ensure_llm_model(force: bool = False) -> str:
         logger.info("Using cached OpenVINO LLM export at %s", output_dir)
         return output_dir
 
-    if not force and _llm_model_exists(output_dir) and not _llm_tokenizer_exists(output_dir):
-        logger.info("Repairing missing tokenizer IR for cached OpenVINO LLM export at %s", output_dir)
-        _export_openvino_tokenizer(hf_id, output_dir)
-        logger.info("LLM ready at %s", output_dir)
-        return output_dir
-
-    weight_format = getattr(llm_cfg, "weight_format", "int8")
+    precision = getattr(llm_cfg, "weight_format", "int8")
     logger.info(
-        "Exporting %s → OpenVINO IR at %s (weight_format=%s). "
+        "Exporting %s → OpenVINO IR at %s (precision=%s). "
         "This takes a few minutes on first run.",
-        hf_id, output_dir, weight_format,
+        hf_id, output_dir, precision,
     )
-    _export_openvino_model(hf_id, output_dir, weight_format)
+    _export_openvino_model(hf_id, output_dir, precision=precision)
 
     if not _llm_export_ready(output_dir):
         raise RuntimeError(

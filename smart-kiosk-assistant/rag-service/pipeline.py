@@ -3,20 +3,19 @@ from __future__ import annotations
 import gc
 import logging
 import pathlib
-import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Generator
 
-import openvino_genai as ov_genai
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from transformers import AutoTokenizer
+from transformers import TextIteratorStreamer
 
 from components.chunker_component import SemanticChunker
 from components.embedding_component import EmbeddingComponent
+from components.llm_component import OVLLMComponent
 from utils.config_loader import config
 from utils.ensure_model import ensure_llm_model, get_llm_model_path
 
@@ -26,66 +25,6 @@ logger = logging.getLogger(__name__)
 _SHARED_PIPELINE: "RagPipeline | None" = None
 _SHARED_PIPELINE_LOCK = threading.Lock()
 
-
-# ---------------------------------------------------------------------------
-# Streaming helper — matches the smart-classroom ov_genai_util pattern exactly,
-# using put() which is the correct openvino_genai.StreamerBase interface.
-# ---------------------------------------------------------------------------
-class YieldingTextStreamer(ov_genai.StreamerBase):
-    def __init__(self, tokenizer, skip_special_tokens: bool = True) -> None:
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.skip_special_tokens = skip_special_tokens
-        self._queue: queue.Queue[str | None] = queue.Queue()
-        self._token_cache: list[int] = []
-        self._print_len = 0
-        self._exc: Exception | None = None
-
-    def put(self, token_id: int) -> bool:
-        self._token_cache.append(token_id)
-        text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
-        new_text = text[self._print_len:]
-        if not new_text:
-            return False
-        if self._is_safe_to_emit(new_text):
-            self._queue.put(new_text)
-            self._print_len = len(text)
-        else:
-            last_token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-            if last_token_text.startswith(" "):
-                prev_chunk = text[self._print_len: len(text) - len(last_token_text)]
-                if prev_chunk:
-                    self._queue.put(prev_chunk)
-                    self._print_len += len(prev_chunk)
-        return False
-
-    def end(self) -> None:
-        if self._token_cache:
-            text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
-            remaining = text[self._print_len:]
-            if remaining:
-                self._queue.put(remaining)
-        self._queue.put(None)
-        self._token_cache.clear()
-        self._print_len = 0
-
-    def __iter__(self):
-        while True:
-            token = self._queue.get()
-            if token is None:
-                break
-            yield token
-
-    @staticmethod
-    def _is_safe_to_emit(text: str) -> bool:
-        last = text[-1]
-        cp = ord(last)
-        return (
-            last.isspace()
-            or last == "\n"
-            or last in {".", ",", "!", "?", ";", ":"}
-            or 0x4E00 <= cp <= 0x9FFF  # CJK
-        )
 
 
 class ChromaEmbeddingAdapter:
@@ -150,16 +89,10 @@ class RagPipeline:
             logger.info("[LLM] OpenVINO model cache enabled at %s", cache_path)
 
         # Tokenizer and pipeline are loaded once at startup and shared behind a lock.
-        logger.info(
-            "Loading HF tokenizer for %s (model path: %s, device: %s)",
-            llm_cfg.hf_id, self._model_path, self._device,
-        )
-        try:
-            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, fix_mistral_regex=True)
-        except TypeError:
-            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path)
         self._llm_lock = threading.RLock()
         self._llm = self._load_llm()
+        # Tokenizer is owned by OVLLMComponent; expose it for SemanticChunker.
+        self._tokenizer = self._llm.tokenizer
 
         self.chunker = SemanticChunker(
             self.embedding_component,
@@ -167,22 +100,15 @@ class RagPipeline:
             llm_tokenizer=self._tokenizer,
         )
 
-    def _load_llm(self) -> ov_genai.LLMPipeline:
-        logger.info(
-            "[LLM] Loading ov_genai.LLMPipeline from %s on %s (plugin_config=%s)",
-            self._model_path, self._device, self._plugin_config or "{}",
+    def _load_llm(self) -> OVLLMComponent:
+        return OVLLMComponent(
+            model_path=self._model_path,
+            device=self._device,
+            ov_config=self._plugin_config if self._plugin_config else None,
         )
-        if self._plugin_config:
-            return ov_genai.LLMPipeline(self._model_path, self._device, **self._plugin_config)
-        return ov_genai.LLMPipeline(self._model_path, self._device)
 
-    def _destroy_llm(self, model: ov_genai.LLMPipeline) -> None:
-        try:
-            del model
-            gc.collect()
-            logger.info("[LLM] Pipeline destroyed, memory reclaimed")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[LLM] Failed to fully destroy pipeline: %s", exc)
+    def _destroy_llm(self, model: OVLLMComponent) -> None:
+        model.destroy()
 
     def close(self) -> None:
         with self._llm_lock:
@@ -208,6 +134,7 @@ class RagPipeline:
             self._destroy_llm(self._llm)
             self._llm = None
         self._llm = self._load_llm()
+        self._tokenizer = self._llm.tokenizer
         self._generations_since_reload = 0
 
     def _post_generation_locked(self) -> None:
@@ -438,30 +365,35 @@ class RagPipeline:
                 self._reload_llm_locked()
                 result = self._llm.generate(prompt, **gen_kwargs)
             self._post_generation_locked()
-        return str(result)
+        return result
 
     def _stream_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> Generator[str, None, None]:
         gen_kwargs = self._generation_kwargs(max_tokens=max_tokens, temperature=temperature)
 
-        streamer = YieldingTextStreamer(self._tokenizer)
+        streamer = TextIteratorStreamer(self._tokenizer, skip_special_tokens=True, skip_prompt=True)
+        error_holder: list[Exception | None] = [None]
 
         def _run_generation() -> None:
             try:
                 with self._llm_lock:
                     try:
-                        self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+                        self._llm.generate_with_streamer(prompt, streamer, **gen_kwargs)
                     except Exception as exc:  # noqa: BLE001
                         if not self._is_resource_exhaustion(exc):
                             raise
                         logger.warning("[LLM] Stream generation hit resource exhaustion; recycling pipeline and retrying once: %s", exc)
                         self._reload_llm_locked()
-                        self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+                        self._llm.generate_with_streamer(prompt, streamer, **gen_kwargs)
                     self._post_generation_locked()
             except Exception as exc:  # noqa: BLE001
                 logger.error("[LLM] Stream generation failed: %s", exc)
-                streamer._exc = exc
+                error_holder[0] = exc
             finally:
-                streamer.end()
+                # Unblock the consumer if generation exited before sending the stop signal.
+                try:
+                    streamer.text_queue.put(streamer.stop_signal)
+                except Exception:  # noqa: BLE001
+                    pass
 
         thread = threading.Thread(target=_run_generation, daemon=True)
         thread.start()
@@ -469,8 +401,8 @@ class RagPipeline:
         for token in streamer:
             yield token
 
-        if streamer._exc is not None:
-            raise streamer._exc
+        if error_holder[0] is not None:
+            raise error_holder[0]
 
     @staticmethod
     def source_payload(record: RetrievalRecord) -> dict:
