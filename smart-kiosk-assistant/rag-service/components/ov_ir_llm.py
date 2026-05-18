@@ -12,9 +12,10 @@ from __future__ import annotations
 import ctypes
 import gc
 import logging
+import threading
 
 from optimum.intel.openvino import OVModelForCausalLM
-from transformers import GenerationConfig
+from transformers import GenerationConfig, TextIteratorStreamer
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,11 @@ class OVIRTextGenPipeline:
         tokenizer,
         device: str = "GPU",
         ov_config: dict | None = None,
+        generation_timeout: float = 90.0,
     ) -> None:
         self._tokenizer = tokenizer
         self._device = device
+        self._generation_timeout = generation_timeout
         logger.info(
             "[OV-MODEL] Loading OVModelForCausalLM from %s on %s (ov_config=%s)",
             model_path, device, ov_config or "{}",
@@ -113,9 +116,88 @@ class OVIRTextGenPipeline:
         cfg.do_sample = do_sample and temperature > 0.0
         cfg.temperature = temperature if cfg.do_sample else None
 
-        output_ids = self._model.generate(**inputs, generation_config=cfg)
+        # Run model.generate() in a daemon thread so we can enforce a wall-clock
+        # timeout. If the GPU hangs, TimeoutError is raised and the pipeline's
+        # error-recovery path (reload + retry) kicks in automatically.
+        _result: list = []
+        _error: list = []
+
+        def _run_generate() -> None:
+            try:
+                _result.append(self._model.generate(**inputs, generation_config=cfg))
+            except Exception as exc:  # noqa: BLE001
+                _error.append(exc)
+
+        _t = threading.Thread(target=_run_generate, daemon=True)
+        _t.start()
+        _t.join(timeout=self._generation_timeout)
+
+        if _t.is_alive():
+            raise TimeoutError(
+                f"LLM generation exceeded {self._generation_timeout:.0f}s — GPU may be hung"
+            )
+        if _error:
+            raise _error[0]
+
+        output_ids = _result[0]
         new_token_ids = output_ids[0][input_len:]
         return self._tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
+
+    def generate_stream(
+        self,
+        prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        do_sample: bool = False,
+    ) -> TextIteratorStreamer:
+        """Token-level streaming via TextIteratorStreamer + background thread.
+
+        Starts generation in a daemon thread and returns the streamer immediately
+        so the caller can iterate tokens as they are produced.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            formatted = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            formatted = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        inputs = self._tokenizer(formatted, return_tensors="pt")
+
+        cfg = GenerationConfig(**self._gen_config.to_dict())
+        cfg.max_new_tokens = max_new_tokens
+        cfg.do_sample = do_sample and temperature > 0.0
+        cfg.temperature = temperature if cfg.do_sample else None
+
+        streamer = TextIteratorStreamer(
+            self._tokenizer,
+            skip_special_tokens=True,
+            skip_prompt=True,
+            timeout=self._generation_timeout,
+        )
+
+        def _run() -> None:
+            try:
+                self._model.generate(**inputs, generation_config=cfg, streamer=streamer)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[OV-MODEL] Streaming generation error: %s", exc, exc_info=True)
+            finally:
+                # Ensure the consumer loop always terminates even on error.
+                try:
+                    streamer.end()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        threading.Thread(target=_run, daemon=True).start()
+        return streamer
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -50,9 +50,11 @@ answering:
   fallback_to_general_knowledge: true
   include_source_markers: false
   max_tokens: 192
-  # Proactively recycle the OpenVINO LLMPipeline after this many generate()
-  # calls to release iGPU KV/working memory and avoid CL_OUT_OF_RESOURCES.
-  # finish_chat() resets KV state after every call; full reload every N calls
-  # releases pre-allocated GPU buffer pools.
-  # Set to 0 to disable proactive recycling (only on-error recycling will run).
-  max_generations_before_reload: 3
+  # If a single model.generate() call does not complete within this many seconds
+  # (e.g. GPU deadlock / OOM hang), it is cancelled, the pipeline is reloaded,
+  # and the request is retried once with a fresh model instance.
+  generation_timeout_secs: 90
+  # OVModelForCausalLM has no persistent KV state between calls, so proactive
+  # reload is not needed. Set to 0 to disable (gc.collect + malloc_trim run
+  # after every generation instead).
+  max_generations_before_reload: 0
