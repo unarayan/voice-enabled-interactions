@@ -11,6 +11,8 @@
 </div>
 hide_directive-->
 
+This application is part of the Voice Enabled Interactions reference architecture for retail.
+
 Smart Kiosk Assistant is a voice-first, retrieval-augmented kiosk stack
 for retail, Quick Service Restaurant (QSR), and similar customer-facing deployments. The browser
 captures microphone audio, the stack transcribes it, retrieves a grounded
